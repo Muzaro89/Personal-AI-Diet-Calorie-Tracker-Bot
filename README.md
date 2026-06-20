@@ -1,6 +1,7 @@
 # Personal-AI-Diet-Calorie-Tracker-Bot
 A personalized, AI-powered nutrition and calorie tracking assistant built using **FastAPI**, **Gemini 1.5 Flash**, and **Telegram Bot API**. This is a **personal project** designed to logs daily food intake with zero friction—simply by snapping a photo of the meal and sending it via Telegram.
 
+(This is a personal ongoing project)
 
 # 🍳 NutriBot: AI-Powered Dietary Tracker & Food Journal
 
@@ -28,6 +29,7 @@ A personalized, AI-powered nutrition and calorie tracking assistant built using 
 ## 🏗️ Struktur Arsitektur
 
 Sistem ini dibangun dengan pendekatan *event-driven* menggunakan webhook:
+```bash
 [User] ---> (Kirim Foto / Koreksi Teks) ---> [Telegram Bot API]
 |
 (Webhook HTTP POST)
@@ -47,7 +49,7 @@ v
 [User] <--- (Balasan Analisis & Total Hari Ini) <-- [Bot API]
 
 ---
-
+```
 ## 🛠️ Tech Stack & Dependensi
 
 - **Backend Framework:** FastAPI (Python)
