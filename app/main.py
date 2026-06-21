@@ -1,17 +1,29 @@
 from contextlib import asynccontextmanager
 from datetime import date
+import re
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import get_db, init_db
-from app.gemini_service import analyze_food_image
-from app.models import FoodLog, User
+from app.database import (
+    get_daily_totals,
+    get_db,
+    get_last_food_log,
+    get_or_create_user,
+    init_db,
+    save_food_log,
+    update_food_log,
+)
+from app.gemini_service import FoodAnalysisResult, analyze_food_image, recalculate_food_with_correction
 
 TELEGRAM_API = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
+
+CORRECTION_PATTERN = re.compile(
+    r"^[+\-]|^\d+\s*g\b|tambah|kurang|koreksi|ganti|tanpa|extra|ekstra",
+    re.IGNORECASE,
+)
 
 
 @asynccontextmanager
@@ -56,20 +68,7 @@ async def download_telegram_photo(file_id: str) -> tuple[bytes, str]:
         return download_response.content, mime_type
 
 
-def get_or_create_user(db: Session, telegram_id: int, username: str | None) -> User:
-    user = db.query(User).filter(User.telegram_id == telegram_id).one_or_none()
-    if user is None:
-        user = User(telegram_id=telegram_id, username=username)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    elif username and user.username != username:
-        user.username = username
-        db.commit()
-    return user
-
-
-def format_food_result(result) -> str:
+def format_food_result(result: FoodAnalysisResult) -> str:
     return (
         f"🍽 <b>{result.food_name}</b>\n\n"
         f"🔥 Kalori: {result.calories:.0f} kcal\n"
@@ -79,31 +78,128 @@ def format_food_result(result) -> str:
     )
 
 
-def format_daily_summary(db: Session, user: User, target_date: date) -> str:
-    totals = (
-        db.query(
-            func.count(FoodLog.id),
-            func.coalesce(func.sum(FoodLog.calories), 0),
-            func.coalesce(func.sum(FoodLog.protein), 0),
-            func.coalesce(func.sum(FoodLog.carbs), 0),
-            func.coalesce(func.sum(FoodLog.fat), 0),
-        )
-        .filter(FoodLog.user_id == user.id, FoodLog.log_date == target_date)
-        .one()
-    )
-
-    count, calories, protein, carbs, fat = totals
-    if count == 0:
+def format_daily_summary(totals: dict[str, float | int], target_date: date) -> str:
+    if totals["count"] == 0:
         return f"Belum ada log makanan untuk tanggal {target_date.isoformat()}."
 
     return (
         f"📊 <b>Ringkasan {target_date.isoformat()}</b>\n\n"
-        f"🍱 Jumlah makanan: {count}\n"
-        f"🔥 Total kalori: {calories:.0f} kcal\n"
-        f"🥩 Protein: {protein:.1f} g\n"
-        f"🍞 Karbo: {carbs:.1f} g\n"
-        f"🧈 Lemak: {fat:.1f} g"
+        f"🍱 Jumlah makanan: {totals['count']}\n"
+        f"🔥 Total kalori: {totals['calories']:.0f} kcal\n"
+        f"🥩 Protein: {totals['protein']:.1f} g\n"
+        f"🍞 Karbo: {totals['carbs']:.1f} g\n"
+        f"🧈 Lemak: {totals['fat']:.1f} g"
     )
+
+
+def format_photo_reply(result: FoodAnalysisResult, totals: dict[str, float | int]) -> str:
+    return (
+        f"{format_food_result(result)}\n\n"
+        f"✅ Tersimpan ke log harian.\n\n"
+        f"📊 <b>Total kalori hari ini: {totals['calories']:.0f} kcal</b>"
+    )
+
+
+def format_correction_reply(result: FoodAnalysisResult, totals: dict[str, float | int]) -> str:
+    return (
+        f"✏️ <b>Koreksi diterapkan</b>\n\n"
+        f"{format_food_result(result)}\n\n"
+        f"📊 <b>Total kalori hari ini: {totals['calories']:.0f} kcal</b>"
+    )
+
+
+def is_correction_message(text: str) -> bool:
+    if not text or text.startswith("/"):
+        return False
+    return bool(CORRECTION_PATTERN.search(text))
+
+
+def food_log_to_result(food_log) -> FoodAnalysisResult:
+    return FoodAnalysisResult(
+        food_name=food_log.food_name,
+        calories=food_log.calories,
+        protein=food_log.protein,
+        carbs=food_log.carbs,
+        fat=food_log.fat,
+    )
+
+
+async def handle_text_message(chat_id: int, text: str, db: Session, user) -> None:
+    if text.startswith("/start"):
+        await send_telegram_message(
+            chat_id,
+            "Halo! Kirim foto makanan untuk dianalisis.\n\n"
+            "Perintah:\n"
+            "/today — ringkasan makanan hari ini\n\n"
+            "Koreksi:\n"
+            "Kirim teks seperti <code>+100g nasi</code> untuk menyesuaikan log terakhir.",
+        )
+        return
+
+    if text.startswith("/today"):
+        totals = get_daily_totals(db, user.id, date.today())
+        await send_telegram_message(chat_id, format_daily_summary(totals, date.today()))
+        return
+
+    if is_correction_message(text):
+        await handle_correction_message(chat_id, text, db, user)
+        return
+
+    await send_telegram_message(
+        chat_id,
+        "Kirim foto makanan agar saya bisa menganalisis kalorinya.\n"
+        "Ketik /today untuk ringkasan, atau kirim koreksi seperti <code>+100g nasi</code>.",
+    )
+
+
+async def handle_correction_message(chat_id: int, text: str, db: Session, user) -> None:
+    last_log = get_last_food_log(db, user.id, log_date=date.today())
+    if last_log is None:
+        await send_telegram_message(
+            chat_id,
+            "Belum ada log makanan hari ini untuk dikoreksi. Kirim foto makanan dulu.",
+        )
+        return
+
+    await send_telegram_message(chat_id, "⏳ Menghitung ulang berdasarkan koreksi...")
+
+    previous = food_log_to_result(last_log)
+    result = await recalculate_food_with_correction(previous, text)
+
+    update_food_log(
+        db,
+        last_log,
+        food_name=result.food_name,
+        calories=result.calories,
+        protein=result.protein,
+        carbs=result.carbs,
+        fat=result.fat,
+    )
+
+    totals = get_daily_totals(db, user.id, date.today())
+    await send_telegram_message(chat_id, format_correction_reply(result, totals))
+
+
+async def handle_photo_message(chat_id: int, photos: list, db: Session, user) -> None:
+    await send_telegram_message(chat_id, "⏳ Menganalisis foto makanan...")
+
+    file_id = photos[-1]["file_id"]
+    image_bytes, mime_type = await download_telegram_photo(file_id)
+    result = await analyze_food_image(image_bytes, mime_type)
+
+    save_food_log(
+        db,
+        user_id=user.id,
+        food_name=result.food_name,
+        calories=result.calories,
+        protein=result.protein,
+        carbs=result.carbs,
+        fat=result.fat,
+        log_date=date.today(),
+    )
+
+    totals = get_daily_totals(db, user.id, date.today())
+    await send_telegram_message(chat_id, format_photo_reply(result, totals))
 
 
 @app.get("/health")
@@ -111,14 +207,12 @@ async def health_check():
     return {"status": "ok"}
 
 
-@app.post("/webhook/{secret}")
-async def telegram_webhook(
-    secret: str,
-    request: Request,
-    db: Session = Depends(get_db),
-):
-    if settings.webhook_secret and secret != settings.webhook_secret:
-        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+@app.post("/webhook")
+async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
+ #   if settings.webhook_secret:
+ #       secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+ #       if secret != settings.webhook_secret:
+ #           raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     update = await request.json()
     message = update.get("message") or update.get("edited_message")
@@ -131,58 +225,21 @@ async def telegram_webhook(
     if telegram_id is None:
         return {"ok": True}
 
-    text = (message.get("text") or "").strip()
     user = get_or_create_user(db, telegram_id, from_user.get("username"))
-
-    if text.startswith("/start"):
-        await send_telegram_message(
-            chat_id,
-            "Halo! Kirim foto makanan untuk dianalisis.\n\n"
-            "Perintah:\n"
-            "/today — ringkasan makanan hari ini",
-        )
-        return {"ok": True}
-
-    if text.startswith("/today"):
-        summary = format_daily_summary(db, user, date.today())
-        await send_telegram_message(chat_id, summary)
-        return {"ok": True}
-
+    text = (message.get("text") or "").strip()
     photos = message.get("photo")
-    if not photos:
-        await send_telegram_message(
-            chat_id,
-            "Kirim foto makanan agar saya bisa menganalisis kalorinya.",
-        )
-        return {"ok": True}
 
     try:
-        await send_telegram_message(chat_id, "⏳ Menganalisis foto makanan...")
-
-        file_id = photos[-1]["file_id"]
-        image_bytes, mime_type = await download_telegram_photo(file_id)
-        result = await analyze_food_image(image_bytes, mime_type)
-
-        food_log = FoodLog(
-            user_id=user.id,
-            food_name=result.food_name,
-            calories=result.calories,
-            protein=result.protein,
-            carbs=result.carbs,
-            fat=result.fat,
-            log_date=date.today(),
-        )
-        db.add(food_log)
-        db.commit()
-
-        await send_telegram_message(
-            chat_id,
-            format_food_result(result) + "\n\n✅ Tersimpan ke log harian.",
-        )
+        if photos:
+            await handle_photo_message(chat_id, photos, db, user)
+        elif text:
+            await handle_text_message(chat_id, text, db, user)
+        else:
+            await send_telegram_message(
+                chat_id,
+                "Kirim foto makanan atau ketik /today untuk ringkasan harian.",
+            )
     except Exception as exc:
-        await send_telegram_message(
-            chat_id,
-            f"❌ Gagal menganalisis foto: {exc}",
-        )
+        await send_telegram_message(chat_id, f"❌ Terjadi kesalahan: {exc}")
 
     return {"ok": True}

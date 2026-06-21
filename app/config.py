@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     gemini_api_key: str
     database_url: str = "sqlite:///./calorie_tracker.db"
     webhook_secret: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-1.5-flash"
 
 
 settings = Settings()
