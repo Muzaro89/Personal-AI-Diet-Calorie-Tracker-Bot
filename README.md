@@ -113,6 +113,7 @@ Proyek ini dibuat untuk keperluan personal tracking dan jurnal praktis. Estimasi
 📄 Lisensi
 Proyek ini dilisensikan di bawah MIT License - lihat berkas LICENSE untuk detail lebih lanjut.
 
-
+update 21/06
+hasil sudah menunjukkan bahwa botnya sudah berjalan, tapi ada kendala di model llm yang digunakan sehingga saat mengirimkan foto makanan, respon yang didapatkan adalah error limit penggunaan. dibutuhkan pergantian model yang digunakan. proyek ini akan hiatus seminggu karena tgl 25 akan sidang tesis
 
 
